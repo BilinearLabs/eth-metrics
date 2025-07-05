@@ -1,20 +1,23 @@
-package postgresql
+package db
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
-	"github.com/alrevuelta/eth-pools-metrics/schemas"
+	"github.com/bilinearlabs/eth-metrics/schemas"
 	"github.com/ethereum/go-ethereum/common/hexutil"
-	"github.com/jackc/pgx/v4"
 	"github.com/pkg/errors"
+	_ "modernc.org/sqlite"
 )
 
 // If a new field is added, the table has to be manually reset
 var createPoolsMetricsTable = `
 CREATE TABLE IF NOT EXISTS t_pools_metrics_summary (
+     f_timestamp TIMESTAMPTZ NOT NULL,
 	 f_epoch BIGINT,
 	 f_pool TEXT,
 	 f_epoch_timestamp TIMESTAMPTZ NOT NULL,
@@ -35,6 +38,16 @@ CREATE TABLE IF NOT EXISTS t_pools_metrics_summary (
 );
 `
 
+var createProposalDutiesTable = `
+CREATE TABLE IF NOT EXISTS t_proposal_duties (
+	 f_epoch BIGINT,
+	 f_pool TEXT,
+	 f_n_scheduled_blocks BIGINT,
+	 f_n_proposed_blocks BIGINT,
+	 PRIMARY KEY (f_epoch, f_pool)
+);
+`
+
 // If a new field is added, the table has to be manually reset
 var createEthPriceTable = `
 CREATE TABLE IF NOT EXISTS t_eth_price (
@@ -47,7 +60,7 @@ var insertEthPrice = `
 INSERT INTO t_eth_price(
 	f_timestamp,
 	f_eth_price_usd)
-VALUES ($1, $2)
+VALUES (?, ?)
 ON CONFLICT (f_timestamp)
 DO UPDATE SET
    f_eth_price_usd=EXCLUDED.f_eth_price_usd
@@ -61,6 +74,7 @@ DO UPDATE SET
 // LostBalanceKeys        []string
 var insertValidatorPerformance = `
 INSERT INTO t_pools_metrics_summary(
+	f_timestamp,
 	f_epoch,
 	f_pool,
 	f_epoch_timestamp,
@@ -72,9 +86,10 @@ INSERT INTO t_pools_metrics_summary(
 	f_n_valitadors_with_less_balace,
 	f_epoch_earned_balance,
 	f_epoch_lost_balace)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT (f_epoch, f_pool)
 DO UPDATE SET
+   f_timestamp=EXCLUDED.f_timestamp,
    f_epoch_timestamp=EXCLUDED.f_epoch_timestamp,
    f_n_total_votes=EXCLUDED.f_n_total_votes,
 	 f_n_incorrect_source=EXCLUDED.f_n_incorrect_source,
@@ -88,46 +103,53 @@ DO UPDATE SET
 
 // TODO: Add f_epoch_timestamp
 var insertProposalDuties = `
-INSERT INTO t_pools_metrics_summary(
+INSERT INTO t_proposal_duties(
 	f_epoch,
+	f_pool,
 	f_n_scheduled_blocks,
 	f_n_proposed_blocks)
-VALUES ($1, $2, $3)
-ON CONFLICT (f_epoch)
+VALUES (?, ?, ?, ?)
+ON CONFLICT (f_epoch, f_pool)
 DO UPDATE SET
    f_n_scheduled_blocks=EXCLUDED.f_n_scheduled_blocks,
-	 f_n_proposed_blocks=EXCLUDED.f_n_proposed_blocks
+   f_n_proposed_blocks=EXCLUDED.f_n_proposed_blocks
 `
 
-type Postgresql struct {
-	postgresql *pgx.Conn
-	PoolName   string
+type Database struct {
+	db       *sql.DB
+	PoolName string
 }
 
 // postgresql://user:password@netloc:port/dbname
-func New(postgresEndpoint string) (*Postgresql, error) {
-	conn, err := pgx.Connect(context.Background(), postgresEndpoint)
-
+func New(dbPath string) (*Database, error) {
+	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		return nil, err
 	}
 
-	return &Postgresql{
-		postgresql: conn,
+	return &Database{
+		db: db,
 	}, nil
 }
 
-func (a *Postgresql) CreateTable() error {
-	if _, err := a.postgresql.Exec(
+func (a *Database) CreateTables() error {
+	if _, err := a.db.ExecContext(
 		context.Background(),
 		createPoolsMetricsTable); err != nil {
 		return err
 	}
+
+	if _, err := a.db.ExecContext(
+		context.Background(),
+		createProposalDutiesTable); err != nil {
+		return err
+	}
+
 	return nil
 }
 
-func (a *Postgresql) CreateEthPriceTable() error {
-	if _, err := a.postgresql.Exec(
+func (a *Database) CreateEthPriceTable() error {
+	if _, err := a.db.ExecContext(
 		context.Background(),
 		createEthPriceTable); err != nil {
 		return err
@@ -135,11 +157,12 @@ func (a *Postgresql) CreateEthPriceTable() error {
 	return nil
 }
 
-func (a *Postgresql) StoreProposalDuties(epoch uint64, scheduledBlocks uint64, proposedBlocks uint64) error {
-	_, err := a.postgresql.Exec(
+func (a *Database) StoreProposalDuties(epoch uint64, poolName string, scheduledBlocks uint64, proposedBlocks uint64) error {
+	_, err := a.db.ExecContext(
 		context.Background(),
 		insertProposalDuties,
 		epoch,
+		poolName,
 		scheduledBlocks,
 		proposedBlocks)
 
@@ -149,10 +172,11 @@ func (a *Postgresql) StoreProposalDuties(epoch uint64, scheduledBlocks uint64, p
 	return nil
 }
 
-func (a *Postgresql) StoreValidatorPerformance(validatorPerformance schemas.ValidatorPerformanceMetrics) error {
-	_, err := a.postgresql.Exec(
+func (a *Database) StoreValidatorPerformance(validatorPerformance schemas.ValidatorPerformanceMetrics) error {
+	_, err := a.db.ExecContext(
 		context.Background(),
 		insertValidatorPerformance,
+		validatorPerformance.Time,
 		validatorPerformance.Epoch,
 		validatorPerformance.PoolName,
 		validatorPerformance.Time,
@@ -171,11 +195,11 @@ func (a *Postgresql) StoreValidatorPerformance(validatorPerformance schemas.Vali
 	return nil
 }
 
-func (a *Postgresql) StoreEthPrice(ethPriceUsd float32) error {
-	_, err := a.postgresql.Exec(
+func (a *Database) StoreEthPrice(ethPriceUsd float32) error {
+	_, err := a.db.ExecContext(
 		context.Background(),
 		insertEthPrice,
-		time.Now(),
+		time.Now(), // not really correct
 		ethPriceUsd)
 
 	if err != nil {
@@ -184,38 +208,72 @@ func (a *Postgresql) StoreEthPrice(ethPriceUsd float32) error {
 	return nil
 }
 
-func (a *Postgresql) GetPoolKeys(poolName string) ([][]byte, error) {
+func (a *Database) GetPoolKeys(poolName string) ([][]byte, error) {
 	keys := make([][]byte, 0)
-	rows, err := a.postgresql.Query(context.Background(), "select f_key from t_deposits where f_pool=$1", poolName)
+	rows, err := a.db.QueryContext(context.Background(), "select f_key from t_deposits where f_pool=?", poolName)
 	if err != nil {
 		return nil, errors.Wrap(err, fmt.Sprintf("%s: %s", "could not get keys for pool", poolName))
 	}
 
 	defer rows.Close()
 	for rows.Next() {
-		values, err := rows.Values()
+		var keyStr string
+		if err := rows.Scan(&keyStr); err != nil {
+			return nil, err
+		}
+		byteKey, err := hexutil.Decode(fmt.Sprintf("0x%s", keyStr))
 		if err != nil {
 			return nil, err
 		}
-
-		for _, keyStr := range values {
-			byteKey, err := hexutil.Decode(fmt.Sprintf("0x%s", keyStr.(string)))
-			if err != nil {
-				return nil, err
-			}
-			keys = append(keys, byteKey)
-		}
+		keys = append(keys, byteKey)
 	}
 
 	return keys, nil
 }
 
-func (a *Postgresql) GetKeysByFromAddresses(fromAddresses []string) ([][]byte, error) {
-	rows, err := a.postgresql.Query(context.Background(),
-		`select encode(f_validator_pubkey, 'hex')
-		from t_eth1_deposits
-		where (`+getDepositsWhereClause(fromAddresses)+")")
+func (a *Database) GetMissingEpochs(currentEpoch uint64, backfillEpochs uint64) ([]uint64, error) {
+	// Generate the expected range of epochs
+	expectedEpochs := make(map[uint64]bool)
+	for epoch := currentEpoch - backfillEpochs + 1; epoch <= currentEpoch; epoch++ {
+		expectedEpochs[epoch] = true
+	}
 
+	// Query existing epochs in the range
+	query := `
+		SELECT f_epoch
+		FROM t_pools_metrics_summary
+		WHERE f_epoch BETWEEN ? AND ?
+	`
+
+	rows, err := a.db.QueryContext(context.Background(), query, currentEpoch-backfillEpochs+1, currentEpoch)
+	if err != nil {
+		return nil, errors.Wrap(err, "could not get existing epochs")
+	}
+
+	defer rows.Close()
+	for rows.Next() {
+		var epoch uint64
+		if err := rows.Scan(&epoch); err != nil {
+			return nil, err
+		}
+		delete(expectedEpochs, epoch)
+	}
+
+	// Collect missing epochs
+	missingEpochs := make([]uint64, 0, len(expectedEpochs))
+	for epoch := range expectedEpochs {
+		missingEpochs = append(missingEpochs, epoch)
+	}
+
+	// Sort the missing epochs in descending order
+	sort.Slice(missingEpochs, func(i, j int) bool { return missingEpochs[i] < missingEpochs[j] })
+
+	return missingEpochs, nil
+}
+
+func (a *Database) GetKeysByFromAddresses(fromAddresses []string) ([][]byte, error) {
+	query := `select f_validator_pubkey from t_eth1_deposits where (` + getDepositsWhereClause(fromAddresses) + ")"
+	rows, err := a.db.QueryContext(context.Background(), query)
 	if err != nil {
 		return nil, errors.Wrap(err,
 			fmt.Sprintf("%s: %s", "could not get keys for pool",
@@ -225,18 +283,15 @@ func (a *Postgresql) GetKeysByFromAddresses(fromAddresses []string) ([][]byte, e
 	keys := make([][]byte, 0)
 	defer rows.Close()
 	for rows.Next() {
-		values, err := rows.Values()
+		var keyStr string
+		if err := rows.Scan(&keyStr); err != nil {
+			return nil, err
+		}
+		byteKey, err := hexutil.Decode(fmt.Sprintf("0x%s", keyStr))
 		if err != nil {
 			return nil, err
 		}
-
-		for _, keyStr := range values {
-			byteKey, err := hexutil.Decode(fmt.Sprintf("0x%s", keyStr.(string)))
-			if err != nil {
-				return nil, err
-			}
-			keys = append(keys, byteKey)
-		}
+		keys = append(keys, byteKey)
 	}
 
 	return keys, nil
@@ -247,7 +302,7 @@ func getDepositsWhereClause(fromAddresses []string) string {
 	for _, address := range fromAddresses {
 		whereElements = append(
 			whereElements,
-			fmt.Sprintf("f_eth1_sender = decode('%s', 'hex')",
+			fmt.Sprintf("f_eth1_sender = '%s'",
 				strings.TrimPrefix(address, "0x")))
 	}
 	return strings.Join(whereElements, " or ")

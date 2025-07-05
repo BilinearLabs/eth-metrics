@@ -1,2 +1,4 @@
 **/.DS_Store
-eth-pools-metrics
+eth-metrics
+db.db
+eth-deposits

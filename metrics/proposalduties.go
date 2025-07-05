@@ -6,12 +6,14 @@ import (
 	"strings"
 	"time"
 
-	"github.com/alrevuelta/eth-pools-metrics/prometheus"
-    "github.com/alrevuelta/eth-pools-metrics/config"
-	"github.com/alrevuelta/eth-pools-metrics/schemas"
+	apiOther "github.com/attestantio/go-eth2-client/api"
 	api "github.com/attestantio/go-eth2-client/api/v1"
 	"github.com/attestantio/go-eth2-client/http"
 	"github.com/attestantio/go-eth2-client/spec/phase0"
+	"github.com/bilinearlabs/eth-metrics/config"
+	"github.com/bilinearlabs/eth-metrics/db"
+
+	"github.com/bilinearlabs/eth-metrics/schemas"
 	"github.com/pkg/errors"
 	"github.com/rs/zerolog"
 	log "github.com/sirupsen/logrus"
@@ -19,6 +21,7 @@ import (
 
 type ProposalDuties struct {
 	httpClient    *http.Service
+	database      *db.Database
 	eth1Endpoint  string
 	eth2Endpoint  string
 	fromAddresses []string
@@ -29,6 +32,7 @@ func NewProposalDuties(
 	eth1Endpoint string,
 	eth2Endpoint string,
 	fromAddresses []string,
+	database *db.Database,
 	poolNames []string) (*ProposalDuties, error) {
 
 	client, err := http.New(context.Background(),
@@ -48,6 +52,7 @@ func NewProposalDuties(
 		fromAddresses: fromAddresses,
 		poolNames:     poolNames,
 		eth1Endpoint:  eth1Endpoint,
+		database:      database,
 	}, nil
 }
 
@@ -62,7 +67,13 @@ func (p *ProposalDuties) RunProposalMetrics(
 		activeKeys)
 
 	logProposalDuties(poolProposals, poolName)
-	setPrometheusProposalDuties(poolProposals, poolName)
+
+	if p.database != nil {
+		err := p.database.StoreProposalDuties(metrics.Epoch, poolName, uint64(len(poolProposals.Scheduled)), uint64(len(poolProposals.Proposed)))
+		if err != nil {
+			return errors.Wrap(err, "could not store proposal duties")
+		}
+	}
 	return nil
 
 }
@@ -73,16 +84,20 @@ func (p *ProposalDuties) GetProposalDuties(epoch uint64) ([]*api.ProposerDuty, e
 	// Empty indexes to force fetching all duties
 	indexes := make([]phase0.ValidatorIndex, 0)
 
+	opts := apiOther.ProposerDutiesOpts{
+		Indices: indexes,
+		Epoch:   phase0.Epoch(epoch),
+	}
+
 	duties, err := p.httpClient.ProposerDuties(
 		context.Background(),
-		phase0.Epoch(epoch),
-		indexes)
+		&opts)
 
 	if err != nil {
 		return make([]*api.ProposerDuty, 0), err
 	}
 
-	return duties, nil
+	return duties.Data, nil
 }
 
 func (p *ProposalDuties) GetProposedBlocks(epoch uint64) ([]*api.BeaconBlockHeader, error) {
@@ -96,16 +111,22 @@ func (p *ProposalDuties) GetProposedBlocks(epoch uint64) ([]*api.BeaconBlockHead
 		slotStr := strconv.FormatUint(slot, 10)
 		log.Debug("Fetching block for slot:" + slotStr)
 
-		blockHeader, err := p.httpClient.BeaconBlockHeader(context.Background(), slotStr)
+		opts := apiOther.BeaconBlockHeaderOpts{
+			Block: slotStr,
+		}
+
+		blockHeader, err := p.httpClient.BeaconBlockHeader(context.Background(), &opts)
 		if err != nil {
 			// This error is expected in skipped or orphaned blocks
-			if !strings.Contains(err.Error(), "Could not find requested block") {
+			if !strings.Contains(err.Error(), "NOT_FOUND") {
 				return epochBlockHeaders, errors.Wrap(err, "error getting beacon block header")
 			}
 			log.Warn("Block at slot " + slotStr + " was not found")
 			continue
 		}
-		epochBlockHeaders = append(epochBlockHeaders, blockHeader)
+		// Some sleep to avoid rate limiting
+		time.Sleep(1 * time.Second)
+		epochBlockHeaders = append(epochBlockHeaders, blockHeader.Data)
 	}
 
 	return epochBlockHeaders, nil
@@ -252,203 +273,3 @@ func logProposalDuties(
 		}).Info("Missed Duty")
 	}
 }
-
-func setPrometheusProposalDuties(
-	metrics *schemas.ProposalDutiesMetrics,
-	poolName string) {
-
-	prometheus.NOfProposedBlocks.WithLabelValues(
-		poolName).Set(float64(len(metrics.Proposed)))
-
-	prometheus.NOfMissedBlocks.WithLabelValues(
-		poolName).Set(float64(len(metrics.Missed)))
-
-	for _, d := range metrics.Proposed {
-		_ = d
-		/* TODO: Not sure, add pool label
-		prometheus.ProposedBlocks.WithLabelValues(
-			UToStr(metrics.Epoch),
-			UToStr(d.ValIndex)).Inc()
-		*/
-	}
-
-	for _, d := range metrics.Missed {
-		_ = d
-		/* TODO: Not sure, add pool label
-		prometheus.MissedBlocks.WithLabelValues(
-			UToStr(metrics.Epoch),
-			UToStr(d.ValIndex)).Inc()
-		*/
-	}
-}
-
-/*
-func (a *Metrics) RunProposalMetrics() {
-	lastEpoch := uint64(0)
-	for {
-		if a.validatingKeys == nil {
-			log.Warn("No active keys to get duties")
-			time.Sleep(10 * time.Second)
-			continue
-		}
-
-		head, err := GetChainHead(context.Background(), a.beaconChainClient)
-		if err != nil {
-			log.Error("error getting chain head: ", err)
-		}
-		if uint64(head.FinalizedEpoch) <= lastEpoch {
-			time.Sleep(5 * time.Second)
-			continue
-		}
-		log.Info("Fetching duties for epoch: ", head.FinalizedEpoch)
-		duties, blocks, err := a.FetchDuties(context.Background(), uint64(head.FinalizedEpoch))
-		if err != nil {
-			log.Error("could not get duties: ", err)
-			continue
-		}
-		metrics := getProposalDuties(duties, blocks)
-		metrics.Epoch = uint64(head.FinalizedEpoch)
-
-		logProposalDuties(metrics)
-		setPrometheusProposalDuties(metrics)
-
-		lastEpoch = uint64(head.FinalizedEpoch)
-
-		// Temporal fix to memory leak. Perhaps having an infinite loop
-		// inside a routinne is not a good idea. TODO
-		runtime.GC()
-	}
-}
-*/
-
-/*
-
-
-func (a *Metrics) FetchDuties(
-	ctx context.Context,
-	epoch uint64) (
-	*ethpb.DutiesResponse,
-	*ethpb.ListBeaconBlocksResponse,
-	error) {
-
-	dutReq := &ethpb.DutiesRequest{
-		Epoch:      ethTypes.Epoch(epoch),
-		PublicKeys: a.validatingKeys,
-	}
-
-	// TODO: Move this
-	chunkSize := 2000
-	duties, err := a.prysmConcurrent.ParalelGetDuties(ctx, dutReq, chunkSize)
-
-	if err != nil {
-		return nil, nil, errors.Wrap(err, "could not get duties")
-	}
-
-	// Get the blocks in the current epoch
-	blocks, err := a.beaconChainClient.ListBeaconBlocks(ctx, &ethpb.ListBlocksRequest{
-		QueryFilter: &ethpb.ListBlocksRequest_Epoch{
-			Epoch: ethTypes.Epoch(epoch),
-		},
-	})
-
-	if err != nil {
-		return nil, nil, errors.Wrap(err, "could not get blocks")
-	}
-
-	return duties, blocks, nil
-}
-
-// Returns the number of duties in an epoch for all our validators and the number
-// of performed proposals
-func getProposalDuties(
-	duties *ethpb.DutiesResponse,
-	blocks *ethpb.ListBeaconBlocksResponse) *schemas.ProposalDutiesMetrics {
-
-	metrics := &schemas.ProposalDutiesMetrics{
-		Scheduled: make([]schemas.Duty, 0),
-		Proposed:  make([]schemas.Duty, 0),
-		Missed:    make([]schemas.Duty, 0),
-	}
-
-	if duties == nil {
-		log.Warn("No data is available to calculate the duties")
-		return metrics
-	}
-
-	// Scan all duties in the given epoch
-	for i := range duties.CurrentEpochDuties {
-		// If there are any proposal duties append them
-		if len(duties.CurrentEpochDuties[i].ProposerSlots) > 0 {
-			// Pub Key is also available res.CurrentEpochDuties[i].PublicKey
-			valIndex := uint64(duties.CurrentEpochDuties[i].ValidatorIndex)
-			// Most likely there will be only a single proposal per epoch
-			for _, propSlot := range duties.CurrentEpochDuties[i].ProposerSlots {
-				metrics.Scheduled = append(metrics.Scheduled, schemas.Duty{ValIndex: valIndex, Slot: propSlot})
-			}
-		}
-	}
-
-	// Just return if no proposal duties were found for us
-	if len(metrics.Scheduled) == 0 {
-		return metrics
-	}
-
-	// Iterate our validator proposal duties
-	for _, duty := range metrics.Scheduled {
-		// Iterate all blocks and check if we proposed the ones we should
-		for _, block := range blocks.BlockContainers {
-			propIndex, slot, graffiti := getBlockParams(block)
-			// If the block at the slot was proposed by us (valIndex)
-			if duty.ValIndex == propIndex && duty.Slot == slot {
-				metrics.Proposed = append(metrics.Proposed, schemas.Duty{
-					ValIndex: propIndex,
-					Slot:     slot,
-					Graffiti: graffiti})
-				break
-			}
-		}
-	}
-
-	metrics.Missed = getMissedDuties(metrics.Scheduled, metrics.Proposed)
-
-	return metrics
-}
-
-func getMissedDuties(scheduled []schemas.Duty, proposed []schemas.Duty) []schemas.Duty {
-	missed := make([]schemas.Duty, 0)
-
-	for _, s := range scheduled {
-		found := false
-		for _, p := range proposed {
-			if s.Slot == p.Slot && s.ValIndex == p.ValIndex {
-				found = true
-				break
-			}
-		}
-		if found == false {
-			missed = append(missed, s)
-		}
-	}
-
-	return missed
-}
-
-func getBlockParams(block *ethpb.BeaconBlockContainer) (uint64, ethTypes.Slot, string) {
-	var propIndex uint64
-	var slot ethTypes.Slot
-	var graffiti string
-
-	if block.GetAltairBlock() == nil {
-		propIndex = uint64(block.GetPhase0Block().Block.ProposerIndex)
-		slot = block.GetPhase0Block().Block.Slot
-		graffiti = fmt.Sprintf("%s", block.GetPhase0Block().Block.Body.Graffiti)
-	} else {
-		propIndex = uint64(block.GetAltairBlock().Block.ProposerIndex)
-		slot = block.GetAltairBlock().Block.Slot
-		graffiti = fmt.Sprintf("%s", block.GetAltairBlock().Block.Body.Graffiti)
-	}
-	// TODO: Add merge block when implemented
-	return propIndex, slot, graffiti
-}
-
-*/

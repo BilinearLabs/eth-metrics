@@ -8,31 +8,29 @@ import (
 	"strings"
 	"time"
 
+	"github.com/attestantio/go-eth2-client/api"
 	"github.com/attestantio/go-eth2-client/http"
 	"github.com/attestantio/go-eth2-client/spec"
 	"github.com/rs/zerolog"
 
-	"github.com/alrevuelta/eth-pools-metrics/config"
-	"github.com/alrevuelta/eth-pools-metrics/pools"
-	"github.com/alrevuelta/eth-pools-metrics/postgresql"
-	"github.com/alrevuelta/eth-pools-metrics/thegraph"
+	"github.com/bilinearlabs/eth-metrics/config"
+	"github.com/bilinearlabs/eth-metrics/db"
+	"github.com/bilinearlabs/eth-metrics/pools"
 	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
-	//log "github.com/sirupsen/logrus"
 )
 
 type Metrics struct {
 	genesisSeconds uint64
 	slotsInEpoch   uint64
-
+	secondsPerSlot uint64
 	depositedKeys  [][]byte
 	validatingKeys [][]byte
 	withCredList   []string
 	fromAddrList   []string
 	eth1Address    string
 	eth2Address    string
-	theGraph       *thegraph.Thegraph // TODO: Remove
-	postgresql     *postgresql.Postgresql
+	db             *db.Database
 
 	httpClient *http.Service
 
@@ -53,26 +51,14 @@ func NewMetrics(
 	ctx context.Context,
 	config *config.Config) (*Metrics, error) {
 
-	/* TODO: Get from a http endpoint instead of prysm gRPC
-	genesis, err := nodeClient.GetGenesis(ctx, &emptypb.Empty{})
-	if err != nil {
-		return nil, errors.Wrap(err, "error getting genesis info")
-	}*/
-
-	/* TODO: Get from a http endpoint instead of prysm gRPC
-	slotsInEpoch, err := GetSlotsInEpoch(ctx, beaconClient)
-	if err != nil {
-		return nil, errors.Wrap(err, "error getting slots in epoch from config")
-	}*/
-
-	var pg *postgresql.Postgresql
+	var pg *db.Database
 	var err error
-	if config.Postgres != "" {
-		pg, err = postgresql.New(config.Postgres)
+	if config.DatabasePath != "" {
+		pg, err = db.New(config.DatabasePath)
 		if err != nil {
 			return nil, errors.Wrap(err, "could not create postgresql")
 		}
-		err = pg.CreateTable()
+		err = pg.CreateTables()
 		if err != nil {
 			return nil, errors.Wrap(err, "error creating pool table to store data")
 		}
@@ -100,18 +86,47 @@ func NewMetrics(
 
 	httpClient := client.(*http.Service)
 
+	genesis, err := httpClient.Genesis(context.Background(), &api.GenesisOpts{})
+	if err != nil {
+		return nil, errors.Wrap(err, "error getting genesis info")
+	}
+
+	spec, err := httpClient.Spec(context.Background(), &api.SpecOpts{})
+	if err != nil {
+		return nil, errors.Wrap(err, "error getting spec info")
+	}
+
+	slotsPerEpochInterface, found := spec.Data["SLOTS_PER_EPOCH"]
+	if !found {
+		return nil, errors.New("SLOTS_PER_EPOCH not found in spec")
+	}
+
+	secondsPerSlotInterface, found := spec.Data["SECONDS_PER_SLOT"]
+	if !found {
+		return nil, errors.New("SECONDS_PER_SLOT not found in spec")
+	}
+
+	slotsPerEpoch := slotsPerEpochInterface.(uint64)
+
+	secondsPerSlot := uint64(secondsPerSlotInterface.(time.Duration).Seconds())
+
+	log.Info("Genesis time: ", genesis.Data.GenesisTime.Unix())
+	log.Info("Slots per epoch: ", slotsPerEpoch)
+	log.Info("Seconds per slot: ", secondsPerSlot)
+
 	return &Metrics{
-		withCredList: config.WithdrawalCredentials,
-		fromAddrList: config.FromAddress,
-		//genesisSeconds:    uint64(genesis.GenesisTime.Seconds),
-		//slotsInEpoch:      uint64(slotsInEpoch),
-		eth1Address: config.Eth1Address,
-		eth2Address: config.Eth2Address,
-		postgresql:  pg,
-		PoolNames:   config.PoolNames,
-		httpClient:  httpClient,
-		epochDebug:  config.EpochDebug,
-		config:      config,
+		withCredList:   config.WithdrawalCredentials,
+		fromAddrList:   config.FromAddress,
+		genesisSeconds: uint64(genesis.Data.GenesisTime.Unix()),
+		slotsInEpoch:   slotsPerEpoch,
+		secondsPerSlot: secondsPerSlot,
+		eth1Address:    config.Eth1Address,
+		eth2Address:    config.Eth2Address,
+		db:             pg,
+		PoolNames:      config.PoolNames,
+		httpClient:     httpClient,
+		epochDebug:     config.EpochDebug,
+		config:         config,
 	}, nil
 }
 
@@ -119,7 +134,7 @@ func (a *Metrics) Run() {
 	bc, err := NewBeaconState(
 		a.eth1Address,
 		a.eth2Address,
-		a.postgresql,
+		a.db,
 		a.fromAddrList,
 		a.PoolNames,
 		a.config.StateTimeout,
@@ -134,6 +149,7 @@ func (a *Metrics) Run() {
 		a.eth1Address,
 		a.eth2Address,
 		a.fromAddrList,
+		a.db,
 		a.PoolNames)
 
 	if err != nil {
@@ -142,10 +158,10 @@ func (a *Metrics) Run() {
 	a.proposalDuties = pd
 
 	for _, poolName := range a.PoolNames {
-		if poolName == "rocketpool" {
-			go pools.RocketPoolFetcher(a.eth1Address)
-			break
-		}
+		//if poolName == "rocketpool" {
+		//	go pools.RocketPoolFetcher(a.eth1Address)
+		//	break
+		//}
 
 		// Check that the validator keys are correct
 		_, _, err := a.GetValidatorKeys(poolName)
@@ -158,25 +174,34 @@ func (a *Metrics) Run() {
 }
 
 func (a *Metrics) Loop() {
+	// TODO: Move this somewhere. Backfill in time. Eg 1 month.
+	var epochsToBackFill uint64 = 40
+
 	var prevEpoch uint64 = uint64(0)
 	var prevBeaconState *spec.VersionedBeaconState = nil
 	// TODO: Refactor and hoist some stuff out to a function
 	for {
 		// Before doing anything, check if we are in the next epoch
-		headSlot, err := a.httpClient.NodeSyncing(context.Background())
+		opts := api.NodeSyncingOpts{
+			Common: api.CommonOpts{
+				Timeout: 5 * time.Second,
+			},
+		}
+		headSlot, err := a.httpClient.NodeSyncing(context.Background(), &opts)
 		if err != nil {
 			log.Error("Could not get node sync status:", err)
 			time.Sleep(5 * time.Second)
 			continue
 		}
 
-		if headSlot.IsSyncing {
+		if headSlot.Data.IsSyncing {
 			log.Error("Node is not in sync")
 			time.Sleep(5 * time.Second)
 			continue
 		}
 
-		currentEpoch := uint64(headSlot.HeadSlot)/uint64(config.SlotsInEpoch) - 2
+		// Leave some maring of 2 epochs
+		currentEpoch := uint64(headSlot.Data.HeadSlot)/uint64(config.SlotsInEpoch) - 2
 
 		// If a debug epoch is set, overwrite the slot. Will compute just metrics for that epoch
 		if a.epochDebug != "" {
@@ -194,61 +219,44 @@ func (a *Metrics) Loop() {
 			continue
 		}
 
-		// Fetch proposal duties, meaning who shall propose each block within this epoch
-		duties, err := a.proposalDuties.GetProposalDuties(currentEpoch)
+		missingEpochs, err := a.db.GetMissingEpochs(currentEpoch, epochsToBackFill)
 		if err != nil {
 			log.Error(err)
+			time.Sleep(5 * time.Second)
 			continue
 		}
 
-		// Fetch who actually proposed the blocks in this epoch
-		proposed, err := a.proposalDuties.GetProposedBlocks(currentEpoch)
-		if err != nil {
-			log.Error(err)
-			continue
+		if len(missingEpochs) > 0 {
+			log.Info("Backfilling epochs: ", missingEpochs)
 		}
 
-		// Summarize duties + proposed in a struct
-		proposalMetrics, err := a.proposalDuties.GetProposalMetrics(duties, proposed)
-		if err != nil {
-			log.Error(err)
-			continue
-		}
-
-		currentBeaconState, err := a.beaconState.GetBeaconState(currentEpoch)
-		if err != nil {
-			prevBeaconState = nil
-			log.Error("Error fetching beacon state:", err)
-			continue
-		}
-
-		// if no prev beacon state is known, fetch it
-		if prevBeaconState == nil {
-			prevBeaconState, err = a.beaconState.GetBeaconState(currentEpoch - 1)
+		// Do backfilling.
+		for _, epoch := range missingEpochs {
+			if prevBeaconState != nil {
+				prevSlot, err := prevBeaconState.Slot()
+				prevEpoch = uint64(prevSlot) % config.SlotsInEpoch
+				if err != nil {
+					// TODO: Handle this gracefully
+					log.Fatal(err, "error getting slot from previous beacon state")
+				}
+				if (prevEpoch + 1) != epoch {
+					prevBeaconState = nil
+				}
+			}
+			currentBeaconState, err := a.ProcessEpoch(epoch, prevBeaconState)
 			if err != nil {
 				log.Error(err)
+				time.Sleep(5 * time.Second)
 				continue
 			}
+			prevBeaconState = currentBeaconState
 		}
 
-		// Map to quickly convert public keys to index
-		valKeyToIndex := PopulateKeysToIndexesMap(currentBeaconState)
-
-		// Iterate all pools and calculate metrics using the fetched data
-		for _, poolName := range a.PoolNames {
-			poolName, pubKeys, err := a.GetValidatorKeys(poolName)
-			if err != nil {
-				log.Error("TODO", err)
-				continue
-			}
-
-			validatorIndexes := GetIndexesFromKeys(pubKeys, valKeyToIndex)
-
-			// TODO Rename this
-			a.beaconState.Run(pubKeys, poolName, currentBeaconState, prevBeaconState, valKeyToIndex)
-
-			err = a.proposalDuties.RunProposalMetrics(validatorIndexes, poolName, &proposalMetrics)
-			_ = err
+		currentBeaconState, err := a.ProcessEpoch(currentEpoch, prevBeaconState)
+		if err != nil {
+			log.Error(err)
+			time.Sleep(5 * time.Second)
+			continue
 		}
 
 		prevBeaconState = currentBeaconState
@@ -259,6 +267,64 @@ func (a *Metrics) Loop() {
 			os.Exit(0)
 		}
 	}
+}
+
+func (a *Metrics) ProcessEpoch(
+	currentEpoch uint64,
+	prevBeaconState *spec.VersionedBeaconState) (*spec.VersionedBeaconState, error) {
+	// Fetch proposal duties, meaning who shall propose each block within this epoch
+	duties, err := a.proposalDuties.GetProposalDuties(currentEpoch)
+	if err != nil {
+		return nil, errors.Wrap(err, "error getting proposal duties")
+	}
+
+	// Fetch who actually proposed the blocks in this epoch
+	proposed, err := a.proposalDuties.GetProposedBlocks(currentEpoch)
+	if err != nil {
+		return nil, errors.Wrap(err, "error getting proposed blocks")
+	}
+
+	// Summarize duties + proposed in a struct
+	proposalMetrics, err := a.proposalDuties.GetProposalMetrics(duties, proposed)
+	if err != nil {
+		return nil, errors.Wrap(err, "error getting proposal metrics")
+	}
+
+	currentBeaconState, err := a.beaconState.GetBeaconState(currentEpoch)
+	if err != nil {
+		return nil, errors.Wrap(err, "error fetching beacon state")
+	}
+
+	// if no prev beacon state is known, fetch it
+	if prevBeaconState == nil {
+		prevBeaconState, err = a.beaconState.GetBeaconState(currentEpoch - 1)
+		if err != nil {
+			return nil, errors.Wrap(err, "error fetching previous beacon state")
+		}
+	}
+
+	// Map to quickly convert public keys to index
+	valKeyToIndex := PopulateKeysToIndexesMap(currentBeaconState)
+
+	// Iterate all pools and calculate metrics using the fetched data
+	for _, poolName := range a.PoolNames {
+		poolName, pubKeys, err := a.GetValidatorKeys(poolName)
+		if err != nil {
+			return nil, errors.Wrap(err, "error getting validator keys")
+		}
+
+		validatorIndexes := GetIndexesFromKeys(pubKeys, valKeyToIndex)
+
+		// TODO Rename this
+		a.beaconState.Run(pubKeys, poolName, currentBeaconState, prevBeaconState, valKeyToIndex)
+
+		err = a.proposalDuties.RunProposalMetrics(validatorIndexes, poolName, &proposalMetrics)
+		if err != nil {
+			return nil, errors.Wrap(err, "error running proposal metrics")
+		}
+	}
+
+	return currentBeaconState, nil
 }
 
 // Get the validator keys from different sources:
@@ -286,16 +352,7 @@ func (a *Metrics) GetValidatorKeys(poolName string) (string, [][]byte, error) {
 		// trim the file path and extension
 		poolName = filepath.Base(poolName)
 		poolName = strings.TrimSuffix(poolName, filepath.Ext(poolName))
-		// TODO: Remove, only allow keys from file
-	} else if poolName == "rocketpool" {
-		pubKeysDeposited = pools.RocketPoolKeys
-		// TODO: Remove, only allow keys from file
-	} else {
-		poolAddressList := pools.PoolsAddresses[poolName]
-		pubKeysDeposited, err = a.postgresql.GetKeysByFromAddresses(poolAddressList)
-		if err != nil {
-			return "", nil, err
-		}
+
 	}
 	return poolName, pubKeysDeposited, nil
 }

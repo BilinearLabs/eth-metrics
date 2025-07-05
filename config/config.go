@@ -8,7 +8,7 @@ import (
 )
 
 // By default the release is a custom build. CI takes care of upgrading it with
-// go build -v -ldflags="-X 'github.com/alrevuelta/eth-pools-metrics/config.ReleaseVersion=x.y.z'"
+// go build -v -ldflags="-X 'github.com/bilinearlabs/eth-metrics/config.ReleaseVersion=x.y.z'"
 var ReleaseVersion = "custom-build"
 
 // Number of slots in an epoch
@@ -25,7 +25,7 @@ type Config struct {
 	FromAddress           []string
 	BeaconRpcEndpoint     string
 	PrometheusPort        int
-	Postgres              string
+	DatabasePath          string
 	Eth1Address           string
 	Eth2Address           string
 	EpochDebug            string
@@ -60,7 +60,7 @@ func NewCliConfig() (*Config, error) {
 	var prometheusPort = flag.Int("prometheus-port", 9500, "Prometheus port to listen to")
 	var version = flag.Bool("version", false, "Prints the release version and exits")
 	//var poolName = flag.String("pool-name", "required", "Name of the pool being monitored. If known, addresses are loaded by default (see known pools)")
-	var postgres = flag.String("postgres", "", "Postgres db endpoit: postgresql://user:password@netloc:port/dbname (optional)")
+	var databasePath = flag.String("database-path", "", "Database path: db.db (optional)")
 	var eth1Address = flag.String("eth1address", "", "Ethereum 1 http endpoint. To be used by rocket pool")
 	var eth2Address = flag.String("eth2address", "", "Ethereum 2 http endpoint")
 	var stateTimeout = flag.Int("state-timeout", 60, "Timeout in seconds for fetching the beacon state")
@@ -109,7 +109,7 @@ func NewCliConfig() (*Config, error) {
 		PrometheusPort:        *prometheusPort,
 		WithdrawalCredentials: withdrawalCredentials,
 		FromAddress:           fromAddress,
-		Postgres:              *postgres,
+		DatabasePath:          *databasePath,
 		Eth1Address:           *eth1Address,
 		Eth2Address:           *eth2Address,
 		EpochDebug:            *epochDebug,
@@ -128,7 +128,7 @@ func logConfig(cfg *Config) {
 		"FromAddress":           cfg.FromAddress,
 		"Network":               cfg.Network,
 		"PrometheusPort":        cfg.PrometheusPort,
-		"Postgres":              cfg.Postgres,
+		"DatabasePath":          cfg.DatabasePath,
 		"Eth1Address":           cfg.Eth1Address,
 		"Eth2Address":           cfg.Eth2Address,
 		"EpochDebug":            cfg.EpochDebug,

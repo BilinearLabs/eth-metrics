@@ -1,4 +1,4 @@
-FROM golang:1.17-alpine AS build
+FROM golang:1.24-alpine AS build
 
 WORKDIR /app
 
@@ -6,12 +6,12 @@ COPY . .
 
 RUN apk add --update gcc g++
 RUN go mod download
-RUN go build -o /eth-pools-metrics
+RUN go build -o /eth-metrics
 
-FROM golang:1.17-alpine
+FROM golang:1.24-alpine
 
 WORKDIR /
 
-COPY --from=build /eth-pools-metrics /eth-pools-metrics
+COPY --from=build /eth-metrics /eth-metrics
 
-ENTRYPOINT ["/eth-pools-metrics"]
+ENTRYPOINT ["/eth-metrics"]
