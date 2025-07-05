@@ -8,18 +8,16 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/attestantio/go-eth2-client/api"
 	"github.com/attestantio/go-eth2-client/http"
 	"github.com/attestantio/go-eth2-client/spec"
 	"github.com/attestantio/go-eth2-client/spec/altair"
 	"github.com/attestantio/go-eth2-client/spec/phase0"
 	"github.com/pkg/errors"
 
-	//"github.com/alrevuelta/eth-pools-metrics/prometheus"
-
-	"github.com/alrevuelta/eth-pools-metrics/config"
-	"github.com/alrevuelta/eth-pools-metrics/postgresql"
-	"github.com/alrevuelta/eth-pools-metrics/prometheus"
-	"github.com/alrevuelta/eth-pools-metrics/schemas"
+	"github.com/bilinearlabs/eth-metrics/config"
+	"github.com/bilinearlabs/eth-metrics/db"
+	"github.com/bilinearlabs/eth-metrics/schemas"
 	"github.com/rs/zerolog"
 
 	log "github.com/sirupsen/logrus"
@@ -29,7 +27,7 @@ type BeaconState struct {
 	httpClient    *http.Service
 	eth1Endpoint  string
 	eth2Endpoint  string
-	pg            *postgresql.Postgresql
+	database      *db.Database
 	fromAddresses []string
 	poolNames     []string
 	timeout       int
@@ -38,7 +36,7 @@ type BeaconState struct {
 func NewBeaconState(
 	eth1Endpoint string,
 	eth2Endpoint string,
-	pg *postgresql.Postgresql,
+	database *db.Database,
 	fromAddresses []string,
 	poolNames []string,
 	timeout int,
@@ -58,7 +56,7 @@ func NewBeaconState(
 	return &BeaconState{
 		httpClient:    httpClient,
 		eth2Endpoint:  eth2Endpoint,
-		pg:            pg, //TODO: Remove from here
+		database:      database,
 		fromAddresses: fromAddresses,
 		poolNames:     poolNames,
 		eth1Endpoint:  eth1Endpoint,
@@ -82,10 +80,25 @@ func (p *BeaconState) Run(
 		return errors.New("TODO:")
 	}
 
+	currentSlot, err := currentBeaconState.Slot()
+	if err != nil {
+		return errors.Wrap(err, "error getting slot from current beacon state")
+	}
+
+	prevSlot, err := prevBeaconState.Slot()
+	if err != nil {
+		return errors.Wrap(err, "error getting slot from previous beacon state")
+	}
+
+	if currentSlot != (prevSlot + phase0.Slot(1)) {
+		return errors.New("slot mismatch between current and previous beacon state")
+	}
+
 	validatorIndexes := GetIndexesFromKeys(validatorKeys, valKeyToIndex)
 	activeValidatorIndexes := GetActiveIndexes(validatorIndexes, currentBeaconState)
 
 	metrics, err := PopulateParticipationAndBalance(
+		poolName,
 		activeValidatorIndexes,
 		currentBeaconState,
 		prevBeaconState)
@@ -110,7 +123,14 @@ func (p *BeaconState) Run(
 	log.Info("Pool: ", poolName, " sync committee validators ", poolSyncIndexes)
 
 	logMetrics(metrics, poolName)
-	setPrometheusMetrics(metrics, poolSyncIndexes, poolName)
+
+	if p.database != nil {
+		err := p.database.StoreValidatorPerformance(metrics)
+		if err != nil {
+			return errors.Wrap(err, "could not store validator performance")
+		}
+	}
+
 	return nil
 }
 
@@ -159,6 +179,7 @@ func BLSPubKeyToByte(blsKeys []phase0.BLSPubKey) [][]byte {
 
 // Make sure the validator indexes are active
 func PopulateParticipationAndBalance(
+	poolName string,
 	activeValidatorIndexes []uint64,
 	beaconState *spec.VersionedBeaconState,
 	prevBeaconState *spec.VersionedBeaconState) (schemas.ValidatorPerformanceMetrics, error) {
@@ -200,6 +221,8 @@ func PopulateParticipationAndBalance(
 	metrics.IndexesLessBalance = lessBalanceIndexes
 	metrics.EarnedBalance = earnedBalance
 	metrics.LosedBalance = lostBalance
+	metrics.PoolName = poolName
+	metrics.Time = time.Unix(int64(GetTimestamp(beaconState)), 0)
 
 	metrics.Epoch = GetSlot(beaconState) / config.SlotsInEpoch
 
@@ -234,14 +257,17 @@ func (p *BeaconState) GetBeaconState(epoch uint64) (*spec.VersionedBeaconState, 
 
 	ctxTimeout, cancel := context.WithTimeout(context.Background(), time.Second*time.Duration(p.timeout))
 	defer cancel()
+	opts := api.BeaconStateOpts{
+		State: slotStr,
+	}
 	beaconState, err := p.httpClient.BeaconState(
 		ctxTimeout,
-		slotStr)
+		&opts)
 	if err != nil {
 		return nil, err
 	}
-	log.Info("Got beacon state for epoch:", GetSlot(beaconState)/config.SlotsInEpoch)
-	return beaconState, nil
+	log.Info("Got beacon state for epoch:", GetSlot(beaconState.Data)/config.SlotsInEpoch)
+	return beaconState.Data, nil
 }
 
 func GetTotalBalanceAndEffective(
@@ -405,8 +431,7 @@ func Slashings(beaconState *spec.VersionedBeaconState) {
 			nOfSlashedValidators++
 		}
 	}
-	prometheus.TotalDepositedValidators.Set(float64(len(validators)))
-	prometheus.TotalSlashedValidators.Set(float64(nOfSlashedValidators))
+
 	log.WithFields(log.Fields{
 		"Total Validators":         len(validators),
 		"Total Slashed Validators": nOfSlashedValidators,
@@ -501,69 +526,6 @@ func logMetrics(
 	}).Info(poolName + " Stats:")
 }
 
-func setPrometheusMetrics(
-	metrics schemas.ValidatorPerformanceMetrics,
-	numSyncValidators []uint64,
-	poolName string) {
-
-	prometheus.TotalBalanceMetrics.WithLabelValues(
-		poolName).Set(float64(metrics.TotalBalance.Int64()))
-
-	prometheus.ActiveValidatorsMetrics.WithLabelValues(
-		poolName).Set(float64(metrics.NOfValidatingKeys))
-
-	prometheus.IncorrectSourceMetrics.WithLabelValues(
-		poolName).Set(float64(metrics.NOfIncorrectSource))
-
-	prometheus.IncorrectTargetMetrics.WithLabelValues(
-		poolName).Set(float64(metrics.NOfIncorrectTarget))
-
-	prometheus.IncorrectHeadMetrics.WithLabelValues(
-		poolName).Set(float64(metrics.NOfIncorrectHead))
-
-	prometheus.EpochEarnedAmountMetrics.WithLabelValues(
-		poolName).Set(float64(metrics.EarnedBalance.Int64()))
-
-	prometheus.EpochLostAmountMetrics.WithLabelValues(
-		poolName).Set(float64(metrics.LosedBalance.Int64()))
-
-	prometheus.DeltaEpochBalanceMetrics.WithLabelValues(
-		poolName).Set(float64(metrics.DeltaEpochBalance.Int64()))
-
-	prometheus.CumulativeConsensusRewards.WithLabelValues(
-		poolName).Set(float64(metrics.TotalRewards.Int64()))
-
-	prometheus.NumOfSyncCommitteeValidators.WithLabelValues(
-		poolName).Set(float64(len(numSyncValidators)))
-
-	// TODO: Add the indexes of the sync committees
-	// TODO: Add if the sync committees are fulfilling their duties or not
-
-	// TODO: Remove this from here and from prometheus
-	//prometheus.NOfTotalVotes.Set(float64(metrics.NOfTotalVotes))
-	//prometheus.NOfIncorrectSource.Set(float64(metrics.NOfIncorrectSource))
-	//prometheus.NOfIncorrectTarget.Set(float64(metrics.NOfIncorrectTarget))
-	//prometheus.NOfIncorrectHead.Set(float64(metrics.NOfIncorrectHead))
-	//prometheus.EarnedAmountInEpoch.Set(float64(metrics.EarnedBalance.Int64()))
-	//prometheus.LosedAmountInEpoch.Set(float64(metrics.LosedBalance.Int64()))
-	//prometheus.CumulativeRewards.Set(float64(metrics.TotalRewards.Int64()))
-	//prometheus.TotalBalance.Set(float64(metrics.TotalBalance.Int64()))
-	//prometheus.EffectiveBalance.Set(float64(metrics.EffectiveBalance.Int64()))
-
-	// TODO: Deprecate this, send the raw number
-	balanceDecreasedPercent := (float64(metrics.NOfValsWithLessBalance) / float64(metrics.NOfValidatingKeys)) * 100
-	prometheus.BalanceDecreasedPercent.Set(balanceDecreasedPercent)
-
-	/* TODO:
-	for _, v := range metrics.MissedAttestationsKeys {
-		prometheus.MissedAttestationsKeys.WithLabelValues(v).Inc()
-	}
-
-	for _, v := range metrics.LostBalanceKeys {
-		prometheus.LessBalanceKeys.WithLabelValues(v).Inc()
-	}*/
-}
-
 // Wrappers on top of the beacon state to fetch some fields regardless of Altair or Bellatrix
 // Note that this is needed because both block types do not implement the same interface, since
 // the state differs accross versions.
@@ -577,6 +539,10 @@ func GetValidators(beaconState *spec.VersionedBeaconState) []*phase0.Validator {
 		validators = beaconState.Bellatrix.Validators
 	} else if beaconState.Capella != nil {
 		validators = beaconState.Capella.Validators
+	} else if beaconState.Deneb != nil {
+		validators = beaconState.Deneb.Validators
+	} else if beaconState.Electra != nil {
+		validators = beaconState.Electra.Validators
 	} else {
 		log.Fatal("Beacon state was empty")
 	}
@@ -591,6 +557,10 @@ func GetBalances(beaconState *spec.VersionedBeaconState) []uint64 {
 		tmpBalances = beaconState.Bellatrix.Balances
 	} else if beaconState.Capella != nil {
 		tmpBalances = beaconState.Capella.Balances
+	} else if beaconState.Deneb != nil {
+		tmpBalances = beaconState.Deneb.Balances
+	} else if beaconState.Electra != nil {
+		tmpBalances = beaconState.Electra.Balances
 	} else {
 		log.Fatal("Beacon state was empty")
 	}
@@ -610,6 +580,10 @@ func GetPreviousEpochParticipation(beaconState *spec.VersionedBeaconState) []alt
 		previousEpochParticipation = beaconState.Bellatrix.PreviousEpochParticipation
 	} else if beaconState.Capella != nil {
 		previousEpochParticipation = beaconState.Capella.PreviousEpochParticipation
+	} else if beaconState.Deneb != nil {
+		previousEpochParticipation = beaconState.Deneb.PreviousEpochParticipation
+	} else if beaconState.Electra != nil {
+		previousEpochParticipation = beaconState.Electra.PreviousEpochParticipation
 	} else {
 		log.Fatal("Beacon state was empty")
 	}
@@ -624,10 +598,30 @@ func GetSlot(beaconState *spec.VersionedBeaconState) uint64 {
 		slot = uint64(beaconState.Bellatrix.Slot)
 	} else if beaconState.Capella != nil {
 		slot = uint64(beaconState.Capella.Slot)
+	} else if beaconState.Deneb != nil {
+		slot = uint64(beaconState.Deneb.Slot)
+	} else if beaconState.Electra != nil {
+		slot = uint64(beaconState.Electra.Slot)
 	} else {
 		log.Fatal("Beacon state was empty")
 	}
 	return slot
+}
+
+func GetTimestamp(beaconState *spec.VersionedBeaconState) uint64 {
+	var timestamp uint64
+	if beaconState.Bellatrix != nil {
+		timestamp = uint64(beaconState.Bellatrix.LatestExecutionPayloadHeader.Timestamp)
+	} else if beaconState.Capella != nil {
+		timestamp = uint64(beaconState.Capella.LatestExecutionPayloadHeader.Timestamp)
+	} else if beaconState.Deneb != nil {
+		timestamp = uint64(beaconState.Deneb.LatestExecutionPayloadHeader.Timestamp)
+	} else if beaconState.Electra != nil {
+		timestamp = uint64(beaconState.Electra.LatestExecutionPayloadHeader.Timestamp)
+	} else {
+		log.Fatal("Could not get timestamp from beacon state")
+	}
+	return timestamp
 }
 
 func GetCurrentSyncCommittee(beaconState *spec.VersionedBeaconState) []phase0.BLSPubKey {
@@ -638,6 +632,10 @@ func GetCurrentSyncCommittee(beaconState *spec.VersionedBeaconState) []phase0.BL
 		pubKeys = beaconState.Bellatrix.CurrentSyncCommittee.Pubkeys
 	} else if beaconState.Capella != nil {
 		pubKeys = beaconState.Capella.CurrentSyncCommittee.Pubkeys
+	} else if beaconState.Deneb != nil {
+		pubKeys = beaconState.Deneb.CurrentSyncCommittee.Pubkeys
+	} else if beaconState.Electra != nil {
+		pubKeys = beaconState.Electra.CurrentSyncCommittee.Pubkeys
 	} else {
 		log.Fatal("Beacon state was empty")
 	}

@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/alrevuelta/eth-pools-metrics/schemas"
+	"github.com/bilinearlabs/eth-metrics/schemas"
 	"github.com/stretchr/testify/require"
 )
 
