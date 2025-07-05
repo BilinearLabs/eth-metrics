@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"fmt"
 	"sort"
-	"strings"
 	"time"
 
 	"github.com/bilinearlabs/eth-metrics/schemas"
@@ -269,41 +268,4 @@ func (a *Database) GetMissingEpochs(currentEpoch uint64, backfillEpochs uint64) 
 	sort.Slice(missingEpochs, func(i, j int) bool { return missingEpochs[i] < missingEpochs[j] })
 
 	return missingEpochs, nil
-}
-
-func (a *Database) GetKeysByFromAddresses(fromAddresses []string) ([][]byte, error) {
-	query := `select f_validator_pubkey from t_eth1_deposits where (` + getDepositsWhereClause(fromAddresses) + ")"
-	rows, err := a.db.QueryContext(context.Background(), query)
-	if err != nil {
-		return nil, errors.Wrap(err,
-			fmt.Sprintf("%s: %s", "could not get keys for pool",
-				fromAddresses))
-	}
-
-	keys := make([][]byte, 0)
-	defer rows.Close()
-	for rows.Next() {
-		var keyStr string
-		if err := rows.Scan(&keyStr); err != nil {
-			return nil, err
-		}
-		byteKey, err := hexutil.Decode(fmt.Sprintf("0x%s", keyStr))
-		if err != nil {
-			return nil, err
-		}
-		keys = append(keys, byteKey)
-	}
-
-	return keys, nil
-}
-
-func getDepositsWhereClause(fromAddresses []string) string {
-	whereElements := make([]string, 0)
-	for _, address := range fromAddresses {
-		whereElements = append(
-			whereElements,
-			fmt.Sprintf("f_eth1_sender = '%s'",
-				strings.TrimPrefix(address, "0x")))
-	}
-	return strings.Join(whereElements, " or ")
 }

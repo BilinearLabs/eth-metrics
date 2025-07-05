@@ -2,7 +2,6 @@ package db
 
 import (
 	"math/big"
-	"os"
 	"testing"
 
 	"github.com/bilinearlabs/eth-metrics/schemas"
@@ -10,21 +9,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func Test_TODO(t *testing.T) {
-
-	// Create mock test
-}
-
-func Test_getDepositsWhereClause(t *testing.T) {
-	whereClause := getDepositsWhereClause([]string{"0xkey1", "0xkey2"})
-	require.Equal(t,
-		"f_eth1_sender = decode('key1', 'hex') or f_eth1_sender = decode('key2', 'hex')",
-		whereClause)
-}
-
 func Test_GetMissingEpochs(t *testing.T) {
-	var dbPath = "test.db"
-	db, err := New(dbPath)
+	db, err := New(":memory:")
 	require.NoError(t, err)
 
 	db.CreateTables()
@@ -50,8 +36,4 @@ func Test_GetMissingEpochs(t *testing.T) {
 	log.Info("Epochs: ", epochs)
 	require.NoError(t, err)
 	require.Equal(t, []uint64{198, 199, 200}, epochs)
-
-	t.Cleanup(func() {
-		os.Remove(dbPath)
-	})
 }

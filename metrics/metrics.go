@@ -2,6 +2,7 @@ package metrics
 
 import (
 	"context"
+	"encoding/base64"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -20,31 +21,19 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-type Metrics struct {
+type NetworkParameters struct {
 	genesisSeconds uint64
 	slotsInEpoch   uint64
 	secondsPerSlot uint64
-	depositedKeys  [][]byte
-	validatingKeys [][]byte
-	withCredList   []string
-	fromAddrList   []string
-	eth1Address    string
-	eth2Address    string
-	db             *db.Database
+}
 
-	httpClient *http.Service
-
-	beaconState    *BeaconState
-	proposalDuties *ProposalDuties
-
-	// Slot and epoch and its raw data
-	// TODO: Remove, each metric task has its pace
-	Epoch uint64
-	Slot  uint64
-
-	PoolNames  []string
-	epochDebug string
-	config     *config.Config // TODO: Remove repeated parameters
+type Metrics struct {
+	networkParameters *NetworkParameters
+	config            *config.Config
+	db                *db.Database
+	httpClient        *http.Service
+	beaconState       *BeaconState
+	proposalDuties    *ProposalDuties
 }
 
 func NewMetrics(
@@ -71,14 +60,21 @@ func NewMetrics(
 				log.Fatal(err)
 			}
 			log.Info("File: ", poolName, " contains ", len(pubKeysDeposited), " keys")
-
 		}
+	}
+
+	// Add header with credentials if provided
+	encodedCredentials := base64.StdEncoding.EncodeToString([]byte(config.Credentials))
+	cred := map[string]string{}
+	if config.Credentials != "" {
+		cred["Authorization"] = "Basic " + encodedCredentials
 	}
 
 	client, err := http.New(context.Background(),
 		http.WithTimeout(60*time.Second),
 		http.WithAddress(config.Eth2Address),
 		http.WithLogLevel(zerolog.WarnLevel),
+		http.WithExtraHeaders(cred),
 	)
 	if err != nil {
 		return nil, err
@@ -114,30 +110,26 @@ func NewMetrics(
 	log.Info("Slots per epoch: ", slotsPerEpoch)
 	log.Info("Seconds per slot: ", secondsPerSlot)
 
-	return &Metrics{
-		withCredList:   config.WithdrawalCredentials,
-		fromAddrList:   config.FromAddress,
+	networkParameters := &NetworkParameters{
 		genesisSeconds: uint64(genesis.Data.GenesisTime.Unix()),
 		slotsInEpoch:   slotsPerEpoch,
 		secondsPerSlot: secondsPerSlot,
-		eth1Address:    config.Eth1Address,
-		eth2Address:    config.Eth2Address,
-		db:             pg,
-		PoolNames:      config.PoolNames,
-		httpClient:     httpClient,
-		epochDebug:     config.EpochDebug,
-		config:         config,
+	}
+
+	return &Metrics{
+		networkParameters: networkParameters,
+		db:                pg,
+		httpClient:        httpClient,
+		config:            config,
 	}, nil
 }
 
 func (a *Metrics) Run() {
 	bc, err := NewBeaconState(
-		a.eth1Address,
-		a.eth2Address,
+		a.httpClient,
+		a.networkParameters,
 		a.db,
-		a.fromAddrList,
-		a.PoolNames,
-		a.config.StateTimeout,
+		a.config,
 	)
 	if err != nil {
 		log.Fatal(err)
@@ -146,23 +138,18 @@ func (a *Metrics) Run() {
 	a.beaconState = bc
 
 	pd, err := NewProposalDuties(
-		a.eth1Address,
-		a.eth2Address,
-		a.fromAddrList,
+		a.httpClient,
+		a.networkParameters,
 		a.db,
-		a.PoolNames)
+		a.config,
+	)
 
 	if err != nil {
 		log.Fatal(err)
 	}
 	a.proposalDuties = pd
 
-	for _, poolName := range a.PoolNames {
-		//if poolName == "rocketpool" {
-		//	go pools.RocketPoolFetcher(a.eth1Address)
-		//	break
-		//}
-
+	for _, poolName := range a.config.PoolNames {
 		// Check that the validator keys are correct
 		_, _, err := a.GetValidatorKeys(poolName)
 		if err != nil {
@@ -175,7 +162,7 @@ func (a *Metrics) Run() {
 
 func (a *Metrics) Loop() {
 	// TODO: Move this somewhere. Backfill in time. Eg 1 month.
-	var epochsToBackFill uint64 = 40
+	var epochsToBackFill uint64 = 1
 
 	var prevEpoch uint64 = uint64(0)
 	var prevBeaconState *spec.VersionedBeaconState = nil
@@ -201,15 +188,15 @@ func (a *Metrics) Loop() {
 		}
 
 		// Leave some maring of 2 epochs
-		currentEpoch := uint64(headSlot.Data.HeadSlot)/uint64(config.SlotsInEpoch) - 2
+		currentEpoch := uint64(headSlot.Data.HeadSlot)/uint64(a.networkParameters.slotsInEpoch) - 2
 
 		// If a debug epoch is set, overwrite the slot. Will compute just metrics for that epoch
-		if a.epochDebug != "" {
-			epochDebugUint64, err := strconv.ParseUint(a.epochDebug, 10, 64)
+		if a.config.EpochDebug != "" {
+			epochDebugUint64, err := strconv.ParseUint(a.config.EpochDebug, 10, 64)
 			if err != nil {
 				log.Fatal(err)
 			}
-			log.Warn("Debugging mode, calculating metrics for epoch: ", a.epochDebug)
+			log.Warn("Debugging mode, calculating metrics for epoch: ", a.config.EpochDebug)
 			currentEpoch = epochDebugUint64
 		}
 
@@ -234,7 +221,7 @@ func (a *Metrics) Loop() {
 		for _, epoch := range missingEpochs {
 			if prevBeaconState != nil {
 				prevSlot, err := prevBeaconState.Slot()
-				prevEpoch = uint64(prevSlot) % config.SlotsInEpoch
+				prevEpoch = uint64(prevSlot) % a.networkParameters.slotsInEpoch
 				if err != nil {
 					// TODO: Handle this gracefully
 					log.Fatal(err, "error getting slot from previous beacon state")
@@ -262,7 +249,7 @@ func (a *Metrics) Loop() {
 		prevBeaconState = currentBeaconState
 		prevEpoch = currentEpoch
 
-		if a.epochDebug != "" {
+		if a.config.EpochDebug != "" {
 			log.Warn("Running in debug mode, exiting ok.")
 			os.Exit(0)
 		}
@@ -307,7 +294,7 @@ func (a *Metrics) ProcessEpoch(
 	valKeyToIndex := PopulateKeysToIndexesMap(currentBeaconState)
 
 	// Iterate all pools and calculate metrics using the fetched data
-	for _, poolName := range a.PoolNames {
+	for _, poolName := range a.config.PoolNames {
 		poolName, pubKeys, err := a.GetValidatorKeys(poolName)
 		if err != nil {
 			return nil, errors.Wrap(err, "error getting validator keys")
@@ -327,10 +314,6 @@ func (a *Metrics) ProcessEpoch(
 	return currentBeaconState, nil
 }
 
-// Get the validator keys from different sources:
-// - pool.txt: Opens the file and read the keys from it
-// - rocketpool: Special case, see pools
-// - poolname: Gets the keys from the address used for the deposit
 func (a *Metrics) GetValidatorKeys(poolName string) (string, [][]byte, error) {
 	var pubKeysDeposited [][]byte
 	var err error

@@ -18,49 +18,29 @@ import (
 	"github.com/bilinearlabs/eth-metrics/config"
 	"github.com/bilinearlabs/eth-metrics/db"
 	"github.com/bilinearlabs/eth-metrics/schemas"
-	"github.com/rs/zerolog"
 
 	log "github.com/sirupsen/logrus"
 )
 
 type BeaconState struct {
-	httpClient    *http.Service
-	eth1Endpoint  string
-	eth2Endpoint  string
-	database      *db.Database
-	fromAddresses []string
-	poolNames     []string
-	timeout       int
+	consensus         *http.Service
+	networkParameters *NetworkParameters
+	database          *db.Database
+	config            *config.Config
 }
 
 func NewBeaconState(
-	eth1Endpoint string,
-	eth2Endpoint string,
+	httpClient *http.Service,
+	networkParameters *NetworkParameters,
 	database *db.Database,
-	fromAddresses []string,
-	poolNames []string,
-	timeout int,
+	config *config.Config,
 ) (*BeaconState, error) {
 
-	client, err := http.New(context.Background(),
-		http.WithTimeout(60*time.Second),
-		http.WithAddress(eth2Endpoint),
-		http.WithLogLevel(zerolog.WarnLevel),
-	)
-	if err != nil {
-		return nil, err
-	}
-
-	httpClient := client.(*http.Service)
-
 	return &BeaconState{
-		httpClient:    httpClient,
-		eth2Endpoint:  eth2Endpoint,
-		database:      database,
-		fromAddresses: fromAddresses,
-		poolNames:     poolNames,
-		eth1Endpoint:  eth1Endpoint,
-		timeout:       timeout,
+		consensus:         httpClient,
+		networkParameters: networkParameters,
+		database:          database,
+		config:            config,
 	}, nil
 }
 
@@ -95,9 +75,10 @@ func (p *BeaconState) Run(
 	}
 
 	validatorIndexes := GetIndexesFromKeys(validatorKeys, valKeyToIndex)
-	activeValidatorIndexes := GetActiveIndexes(validatorIndexes, currentBeaconState)
+	activeValidatorIndexes := p.GetActiveIndexes(validatorIndexes, currentBeaconState)
 
-	metrics, err := PopulateParticipationAndBalance(
+	// TODO: Redundant parameters already in the class
+	metrics, err := p.PopulateParticipationAndBalance(
 		poolName,
 		activeValidatorIndexes,
 		currentBeaconState,
@@ -112,7 +93,7 @@ func (p *BeaconState) Run(
 	poolSyncIndexes := GetValidatorsIn(syncCommitteeIndexes, activeValidatorIndexes)
 
 	// Temporal to debug:
-	ParticipationDebug(activeValidatorIndexes, currentBeaconState)
+	p.ParticipationDebug(activeValidatorIndexes, currentBeaconState)
 
 	// TODO: Move network stats out
 	Slashings(currentBeaconState)
@@ -178,7 +159,7 @@ func BLSPubKeyToByte(blsKeys []phase0.BLSPubKey) [][]byte {
 }
 
 // Make sure the validator indexes are active
-func PopulateParticipationAndBalance(
+func (p *BeaconState) PopulateParticipationAndBalance(
 	poolName string,
 	activeValidatorIndexes []uint64,
 	beaconState *spec.VersionedBeaconState,
@@ -192,7 +173,7 @@ func PopulateParticipationAndBalance(
 		TotalRewards:     big.NewInt(0),
 	}
 
-	nOfIncorrectSource, nOfIncorrectTarget, nOfIncorrectHead, indexesMissedAtt := GetParticipation(
+	nOfIncorrectSource, nOfIncorrectTarget, nOfIncorrectHead, indexesMissedAtt := p.GetParticipation(
 		activeValidatorIndexes,
 		beaconState)
 
@@ -209,7 +190,7 @@ func PopulateParticipationAndBalance(
 	rewards := big.NewInt(0).Sub(currentBalance, currentEffectiveBalance)
 	deltaEpochBalance := big.NewInt(0).Sub(currentBalance, prevBalance)
 
-	lessBalanceIndexes, earnedBalance, lostBalance, err := GetValidatorsWithLessBalance(
+	lessBalanceIndexes, earnedBalance, lostBalance, err := p.GetValidatorsWithLessBalance(
 		activeValidatorIndexes,
 		prevBeaconState,
 		beaconState)
@@ -224,7 +205,7 @@ func PopulateParticipationAndBalance(
 	metrics.PoolName = poolName
 	metrics.Time = time.Unix(int64(GetTimestamp(beaconState)), 0)
 
-	metrics.Epoch = GetSlot(beaconState) / config.SlotsInEpoch
+	metrics.Epoch = GetSlot(beaconState) / p.networkParameters.slotsInEpoch
 
 	metrics.NOfTotalVotes = uint64(len(activeValidatorIndexes)) * 3
 	metrics.NOfIncorrectSource = nOfIncorrectSource
@@ -253,20 +234,20 @@ func (p *BeaconState) GetBeaconState(epoch uint64) (*spec.VersionedBeaconState, 
 	// If epoch=1, slot = epoch*32 = 32, which is the first slot of epoch 1
 	// but we want to run the metrics on the last slot, so -1
 	// goes to the last slot of the previous epoch
-	slotStr := strconv.FormatUint(epoch*config.SlotsInEpoch-1, 10)
+	slotStr := strconv.FormatUint(epoch*p.networkParameters.slotsInEpoch-1, 10)
 
-	ctxTimeout, cancel := context.WithTimeout(context.Background(), time.Second*time.Duration(p.timeout))
+	ctxTimeout, cancel := context.WithTimeout(context.Background(), time.Second*time.Duration(p.config.StateTimeout))
 	defer cancel()
 	opts := api.BeaconStateOpts{
 		State: slotStr,
 	}
-	beaconState, err := p.httpClient.BeaconState(
+	beaconState, err := p.consensus.BeaconState(
 		ctxTimeout,
 		&opts)
 	if err != nil {
 		return nil, err
 	}
-	log.Info("Got beacon state for epoch:", GetSlot(beaconState.Data)/config.SlotsInEpoch)
+	log.Info("Got beacon state for epoch:", GetSlot(beaconState.Data)/p.networkParameters.slotsInEpoch)
 	return beaconState.Data, nil
 }
 
@@ -314,14 +295,14 @@ func GetIndexesFromKeys(
 	return indexes
 }
 
-func GetActiveIndexes(
+func (p *BeaconState) GetActiveIndexes(
 	validatorIndexes []uint64,
 	beaconState *spec.VersionedBeaconState) []uint64 {
 
 	activeIndexes := make([]uint64, 0)
 
 	validators := GetValidators(beaconState)
-	beaconStateEpoch := GetSlot(beaconState) / config.SlotsInEpoch
+	beaconStateEpoch := GetSlot(beaconState) / p.networkParameters.slotsInEpoch
 
 	for _, valIdx := range validatorIndexes {
 		if beaconStateEpoch >= uint64(validators[valIdx].ActivationEpoch) &&
@@ -333,13 +314,13 @@ func GetActiveIndexes(
 	return activeIndexes
 }
 
-func GetValidatorsWithLessBalance(
+func (p *BeaconState) GetValidatorsWithLessBalance(
 	activeValidatorIndexes []uint64,
 	prevBeaconState *spec.VersionedBeaconState,
 	currentBeaconState *spec.VersionedBeaconState) ([]uint64, *big.Int, *big.Int, error) {
 
-	prevEpoch := GetSlot(prevBeaconState) / config.SlotsInEpoch
-	currEpoch := GetSlot(currentBeaconState) / config.SlotsInEpoch
+	prevEpoch := GetSlot(prevBeaconState) / p.networkParameters.slotsInEpoch
+	currEpoch := GetSlot(currentBeaconState) / p.networkParameters.slotsInEpoch
 	prevBalances := GetBalances(prevBeaconState)
 	currBalances := GetBalances(currentBeaconState)
 
@@ -376,7 +357,7 @@ func GetValidatorsWithLessBalance(
 	return indexesWithLessBalance, earnedBalance, lostBalance, nil
 }
 
-func ParticipationDebug(
+func (p *BeaconState) ParticipationDebug(
 	activeValidatorIndexes []uint64,
 	beaconState *spec.VersionedBeaconState) {
 
@@ -385,7 +366,7 @@ func ParticipationDebug(
 
 	nActiveValidators := uint64(0)
 
-	beaconStateEpoch := GetSlot(beaconState) / config.SlotsInEpoch
+	beaconStateEpoch := GetSlot(beaconState) / p.networkParameters.slotsInEpoch
 
 	var nCorrectSource, nCorrectTarget, nCorrectHead uint64
 
@@ -440,7 +421,7 @@ func Slashings(beaconState *spec.VersionedBeaconState) {
 
 // See spec: from LSB to MSB: source, target, head.
 // https://github.com/ethereum/consensus-specs/blob/master/specs/altair/beacon-chain.md#participation-flag-indices
-func GetParticipation(
+func (p *BeaconState) GetParticipation(
 	activeValidatorIndexes []uint64,
 	beaconState *spec.VersionedBeaconState) (uint64, uint64, uint64, []uint64) {
 
@@ -456,7 +437,7 @@ func GetParticipation(
 		if validators[valIndx].Slashed {
 			continue
 		}
-		beaconStateEpoch := GetSlot(beaconState) / config.SlotsInEpoch
+		beaconStateEpoch := GetSlot(beaconState) / p.networkParameters.slotsInEpoch
 		// Ignore not yet active validators
 		// TODO: Test this
 		if uint64(validators[valIndx].ActivationEpoch) > beaconStateEpoch {

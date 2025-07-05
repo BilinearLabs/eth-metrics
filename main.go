@@ -40,13 +40,13 @@ func main() {
 		log.Fatal(err)
 	}
 
-	price, err := price.NewPrice(config.DatabasePath)
+	price, err := price.NewPrice(config.DatabasePath, config)
 	if err != nil {
 		log.Fatal(err)
 	}
 
 	// Initialize the database
-	db, err = sql.Open("sqlite3", "./db.db")
+	db, err = sql.Open("sqlite3", config.DatabasePath)
 	if err != nil {
 		log.Fatal(err)
 	}

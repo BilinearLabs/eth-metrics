@@ -4,7 +4,6 @@ import (
 	"context"
 	"strconv"
 	"strings"
-	"time"
 
 	apiOther "github.com/attestantio/go-eth2-client/api"
 	api "github.com/attestantio/go-eth2-client/api/v1"
@@ -15,44 +14,27 @@ import (
 
 	"github.com/bilinearlabs/eth-metrics/schemas"
 	"github.com/pkg/errors"
-	"github.com/rs/zerolog"
 	log "github.com/sirupsen/logrus"
 )
 
 type ProposalDuties struct {
-	httpClient    *http.Service
-	database      *db.Database
-	eth1Endpoint  string
-	eth2Endpoint  string
-	fromAddresses []string
-	poolNames     []string
+	consensus         *http.Service
+	networkParameters *NetworkParameters
+	database          *db.Database
+	config            *config.Config
 }
 
 func NewProposalDuties(
-	eth1Endpoint string,
-	eth2Endpoint string,
-	fromAddresses []string,
+	consensus *http.Service,
+	networkParameters *NetworkParameters,
 	database *db.Database,
-	poolNames []string) (*ProposalDuties, error) {
-
-	client, err := http.New(context.Background(),
-		http.WithTimeout(60*time.Second),
-		http.WithAddress(eth2Endpoint),
-		http.WithLogLevel(zerolog.WarnLevel),
-	)
-	if err != nil {
-		return nil, err
-	}
-
-	httpClient := client.(*http.Service)
+	config *config.Config) (*ProposalDuties, error) {
 
 	return &ProposalDuties{
-		httpClient:    httpClient,
-		eth2Endpoint:  eth2Endpoint,
-		fromAddresses: fromAddresses,
-		poolNames:     poolNames,
-		eth1Endpoint:  eth1Endpoint,
-		database:      database,
+		consensus:         consensus,
+		networkParameters: networkParameters,
+		database:          database,
+		config:            config,
 	}, nil
 }
 
@@ -89,7 +71,7 @@ func (p *ProposalDuties) GetProposalDuties(epoch uint64) ([]*api.ProposerDuty, e
 		Epoch:   phase0.Epoch(epoch),
 	}
 
-	duties, err := p.httpClient.ProposerDuties(
+	duties, err := p.consensus.ProposerDuties(
 		context.Background(),
 		&opts)
 
@@ -104,7 +86,7 @@ func (p *ProposalDuties) GetProposedBlocks(epoch uint64) ([]*api.BeaconBlockHead
 	log.Info("Fetching proposed blocks for epoch: ", epoch)
 
 	epochBlockHeaders := make([]*api.BeaconBlockHeader, 0)
-	slotsInEpoch := uint64(config.SlotsInEpoch)
+	slotsInEpoch := uint64(p.networkParameters.slotsInEpoch)
 
 	for i := uint64(0); i < slotsInEpoch; i++ {
 		slot := epoch*slotsInEpoch + uint64(i)
@@ -115,7 +97,7 @@ func (p *ProposalDuties) GetProposedBlocks(epoch uint64) ([]*api.BeaconBlockHead
 			Block: slotStr,
 		}
 
-		blockHeader, err := p.httpClient.BeaconBlockHeader(context.Background(), &opts)
+		blockHeader, err := p.consensus.BeaconBlockHeader(context.Background(), &opts)
 		if err != nil {
 			// This error is expected in skipped or orphaned blocks
 			if !strings.Contains(err.Error(), "NOT_FOUND") {
@@ -124,8 +106,6 @@ func (p *ProposalDuties) GetProposedBlocks(epoch uint64) ([]*api.BeaconBlockHead
 			log.Warn("Block at slot " + slotStr + " was not found")
 			continue
 		}
-		// Some sleep to avoid rate limiting
-		time.Sleep(1 * time.Second)
 		epochBlockHeaders = append(epochBlockHeaders, blockHeader.Data)
 	}
 
@@ -157,7 +137,7 @@ func (p *ProposalDuties) GetProposalMetrics(
 		return proposalMetrics, errors.New("duties and proposals contains different slots")
 	}*/
 
-	proposalMetrics.Epoch = uint64(proposalDuties[0].Slot) / config.SlotsInEpoch
+	proposalMetrics.Epoch = uint64(proposalDuties[0].Slot) / p.networkParameters.slotsInEpoch
 
 	for _, duty := range proposalDuties {
 		proposalMetrics.Scheduled = append(
