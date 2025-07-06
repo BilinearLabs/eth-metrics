@@ -53,6 +53,12 @@ func Test_GetIndexesFromKeys(t *testing.T) {
 }
 
 func Test_GetValidatorsWithLessBalance(t *testing.T) {
+	b := &BeaconState{
+		networkParameters: &NetworkParameters{
+			slotsInEpoch: 32,
+		},
+	}
+
 	prevBeaconState := &spec.VersionedBeaconState{
 		Altair: &altair.BeaconState{
 			Slot: 34 * 32,
@@ -77,7 +83,7 @@ func Test_GetValidatorsWithLessBalance(t *testing.T) {
 		},
 	}
 
-	indexLessBalance, earnedBalance, lostBalance, err := GetValidatorsWithLessBalance(
+	indexLessBalance, earnedBalance, lostBalance, err := b.GetValidatorsWithLessBalance(
 		[]uint64{0, 1, 2, 3},
 		prevBeaconState,
 		currentBeaconState)
@@ -90,6 +96,12 @@ func Test_GetValidatorsWithLessBalance(t *testing.T) {
 }
 
 func Test_GetValidatorsWithLessBalance_NonConsecutive(t *testing.T) {
+	b := &BeaconState{
+		networkParameters: &NetworkParameters{
+			slotsInEpoch: 32,
+		},
+	}
+
 	currentBeaconState := &spec.VersionedBeaconState{
 		Altair: &altair.BeaconState{
 			Slot: 54 * 32,
@@ -101,7 +113,7 @@ func Test_GetValidatorsWithLessBalance_NonConsecutive(t *testing.T) {
 		},
 	}
 
-	_, _, _, err := GetValidatorsWithLessBalance(
+	_, _, _, err := b.GetValidatorsWithLessBalance(
 		[]uint64{},
 		prevBeaconState,
 		currentBeaconState)
@@ -111,6 +123,12 @@ func Test_GetValidatorsWithLessBalance_NonConsecutive(t *testing.T) {
 
 // TODO: Test that slashed validators are ignored
 func Test_GetParticipation(t *testing.T) {
+	b := &BeaconState{
+		networkParameters: &NetworkParameters{
+			slotsInEpoch: 32,
+		},
+	}
+
 	// Use 6 validators
 	validatorIndexes := []uint64{0, 1, 2, 3, 4, 5}
 
@@ -148,7 +166,7 @@ func Test_GetParticipation(t *testing.T) {
 		},
 	}
 
-	source, target, head, indexesMissedAtt := GetParticipation(
+	source, target, head, indexesMissedAtt := b.GetParticipation(
 		validatorIndexes,
 		beaconState)
 

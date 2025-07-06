@@ -3,18 +3,14 @@ package db
 import (
 	"context"
 	"database/sql"
-	"fmt"
 	"sort"
-	"strings"
 	"time"
 
 	"github.com/bilinearlabs/eth-metrics/schemas"
-	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/pkg/errors"
 	_ "modernc.org/sqlite"
 )
 
-// If a new field is added, the table has to be manually reset
 var createPoolsMetricsTable = `
 CREATE TABLE IF NOT EXISTS t_pools_metrics_summary (
      f_timestamp TIMESTAMPTZ NOT NULL,
@@ -48,7 +44,6 @@ CREATE TABLE IF NOT EXISTS t_proposal_duties (
 );
 `
 
-// If a new field is added, the table has to be manually reset
 var createEthPriceTable = `
 CREATE TABLE IF NOT EXISTS t_eth_price (
 	 f_timestamp TIMESTAMPTZ NOT NULL PRIMARY KEY,
@@ -65,9 +60,6 @@ ON CONFLICT (f_timestamp)
 DO UPDATE SET
    f_eth_price_usd=EXCLUDED.f_eth_price_usd
 `
-
-// TODO: Store price
-//f_eth_price_usd BIGINT,
 
 // TODO: Add missing
 // MissedAttestationsKeys []string
@@ -120,7 +112,6 @@ type Database struct {
 	PoolName string
 }
 
-// postgresql://user:password@netloc:port/dbname
 func New(dbPath string) (*Database, error) {
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
@@ -208,29 +199,6 @@ func (a *Database) StoreEthPrice(ethPriceUsd float32) error {
 	return nil
 }
 
-func (a *Database) GetPoolKeys(poolName string) ([][]byte, error) {
-	keys := make([][]byte, 0)
-	rows, err := a.db.QueryContext(context.Background(), "select f_key from t_deposits where f_pool=?", poolName)
-	if err != nil {
-		return nil, errors.Wrap(err, fmt.Sprintf("%s: %s", "could not get keys for pool", poolName))
-	}
-
-	defer rows.Close()
-	for rows.Next() {
-		var keyStr string
-		if err := rows.Scan(&keyStr); err != nil {
-			return nil, err
-		}
-		byteKey, err := hexutil.Decode(fmt.Sprintf("0x%s", keyStr))
-		if err != nil {
-			return nil, err
-		}
-		keys = append(keys, byteKey)
-	}
-
-	return keys, nil
-}
-
 func (a *Database) GetMissingEpochs(currentEpoch uint64, backfillEpochs uint64) ([]uint64, error) {
 	// Generate the expected range of epochs
 	expectedEpochs := make(map[uint64]bool)
@@ -269,41 +237,4 @@ func (a *Database) GetMissingEpochs(currentEpoch uint64, backfillEpochs uint64) 
 	sort.Slice(missingEpochs, func(i, j int) bool { return missingEpochs[i] < missingEpochs[j] })
 
 	return missingEpochs, nil
-}
-
-func (a *Database) GetKeysByFromAddresses(fromAddresses []string) ([][]byte, error) {
-	query := `select f_validator_pubkey from t_eth1_deposits where (` + getDepositsWhereClause(fromAddresses) + ")"
-	rows, err := a.db.QueryContext(context.Background(), query)
-	if err != nil {
-		return nil, errors.Wrap(err,
-			fmt.Sprintf("%s: %s", "could not get keys for pool",
-				fromAddresses))
-	}
-
-	keys := make([][]byte, 0)
-	defer rows.Close()
-	for rows.Next() {
-		var keyStr string
-		if err := rows.Scan(&keyStr); err != nil {
-			return nil, err
-		}
-		byteKey, err := hexutil.Decode(fmt.Sprintf("0x%s", keyStr))
-		if err != nil {
-			return nil, err
-		}
-		keys = append(keys, byteKey)
-	}
-
-	return keys, nil
-}
-
-func getDepositsWhereClause(fromAddresses []string) string {
-	whereElements := make([]string, 0)
-	for _, address := range fromAddresses {
-		whereElements = append(
-			whereElements,
-			fmt.Sprintf("f_eth1_sender = '%s'",
-				strings.TrimPrefix(address, "0x")))
-	}
-	return strings.Join(whereElements, " or ")
 }

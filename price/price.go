@@ -15,16 +15,17 @@ var vc = []string{"usd", "eurr"}
 type Price struct {
 	database  *db.Database
 	coingecko *gecko.Client
+	config    *config.Config
 }
 
-func NewPrice(postgresEndpoint string) (*Price, error) {
+func NewPrice(dbPath string, config *config.Config) (*Price, error) {
 
 	cg := gecko.NewClient(nil)
 
 	var database *db.Database
 	var err error
-	if postgresEndpoint != "" {
-		database, err = db.New(postgresEndpoint)
+	if dbPath != "" {
+		database, err = db.New(dbPath)
 		if err != nil {
 			return nil, errors.Wrap(err, "could not create postgresql")
 		}
@@ -37,17 +38,18 @@ func NewPrice(postgresEndpoint string) (*Price, error) {
 	return &Price{
 		database:  database,
 		coingecko: cg,
+		config:    config,
 	}, nil
 }
 
 func (p *Price) GetEthPrice() {
 	id := ""
-	if config.Network == "mainnet" {
+	if p.config.Network == "ethereum" {
 		id = "ethereum"
-	} else if config.Network == "gnosis" {
+	} else if p.config.Network == "gnosis" {
 		id = "gnosis"
 	} else {
-		log.Fatal("Network not supported: ", config.Network)
+		log.Fatal("Network not supported: ", p.config.Network)
 	}
 
 	sp, err := p.coingecko.SimplePrice([]string{id}, vc)
