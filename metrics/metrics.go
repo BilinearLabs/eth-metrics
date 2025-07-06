@@ -40,14 +40,15 @@ func NewMetrics(
 	ctx context.Context,
 	config *config.Config) (*Metrics, error) {
 
-	var pg *db.Database
+	var database *db.Database
 	var err error
+
 	if config.DatabasePath != "" {
-		pg, err = db.New(config.DatabasePath)
+		database, err = db.New(config.DatabasePath)
 		if err != nil {
 			return nil, errors.Wrap(err, "could not create postgresql")
 		}
-		err = pg.CreateTables()
+		err = database.CreateTables()
 		if err != nil {
 			return nil, errors.Wrap(err, "error creating pool table to store data")
 		}
@@ -118,7 +119,7 @@ func NewMetrics(
 
 	return &Metrics{
 		networkParameters: networkParameters,
-		db:                pg,
+		db:                database,
 		httpClient:        httpClient,
 		config:            config,
 	}, nil
@@ -161,9 +162,6 @@ func (a *Metrics) Run() {
 }
 
 func (a *Metrics) Loop() {
-	// TODO: Move this somewhere. Backfill in time. Eg 1 month.
-	var epochsToBackFill uint64 = 1
-
 	var prevEpoch uint64 = uint64(0)
 	var prevBeaconState *spec.VersionedBeaconState = nil
 	// TODO: Refactor and hoist some stuff out to a function
@@ -206,7 +204,7 @@ func (a *Metrics) Loop() {
 			continue
 		}
 
-		missingEpochs, err := a.db.GetMissingEpochs(currentEpoch, epochsToBackFill)
+		missingEpochs, err := a.db.GetMissingEpochs(currentEpoch, a.config.BackfillEpochs)
 		if err != nil {
 			log.Error(err)
 			time.Sleep(5 * time.Second)

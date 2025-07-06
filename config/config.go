@@ -12,15 +12,16 @@ import (
 var ReleaseVersion = "custom-build"
 
 type Config struct {
-	PoolNames    []string
-	DatabasePath string
-	Eth1Address  string
-	Eth2Address  string
-	EpochDebug   string
-	Verbosity    string
-	Network      string
-	Credentials  string
-	StateTimeout int
+	PoolNames      []string
+	DatabasePath   string
+	Eth1Address    string
+	Eth2Address    string
+	EpochDebug     string
+	Verbosity      string
+	Network        string
+	Credentials    string
+	BackfillEpochs uint64
+	StateTimeout   int
 }
 
 // custom implementation to allow providing the same flag multiple times
@@ -38,6 +39,8 @@ func (i *arrayFlags) Set(value string) error {
 
 func NewCliConfig() (*Config, error) {
 	var poolNames arrayFlags
+
+	// Allows passing multiple times
 	flag.Var(&poolNames, "pool-name", "Pool name to monitor. Can be useed multiple times")
 
 	var version = flag.Bool("version", false, "Prints the release version and exits")
@@ -49,6 +52,7 @@ func NewCliConfig() (*Config, error) {
 	var epochDebug = flag.String("epoch-debug", "", "Calculates the stats for a given epoch and exits, useful for debugging")
 	var verbosity = flag.String("verbosity", "info", "Logging verbosity (trace, debug, info=default, warn, error, fatal, panic)")
 	var credentials = flag.String("credentials", "", "Credentials for the http client (username:password)")
+	var backfillEpochs = flag.Uint64("backfill-epochs", 0, "Number of epochs to backfill")
 
 	flag.Parse()
 
@@ -58,15 +62,16 @@ func NewCliConfig() (*Config, error) {
 	}
 
 	conf := &Config{
-		PoolNames:    poolNames,
-		DatabasePath: *databasePath,
-		Eth1Address:  *eth1Address,
-		Eth2Address:  *eth2Address,
-		EpochDebug:   *epochDebug,
-		Verbosity:    *verbosity,
-		Network:      *network,
-		Credentials:  *credentials,
-		StateTimeout: *stateTimeout,
+		PoolNames:      poolNames,
+		DatabasePath:   *databasePath,
+		Eth1Address:    *eth1Address,
+		Eth2Address:    *eth2Address,
+		EpochDebug:     *epochDebug,
+		Verbosity:      *verbosity,
+		Network:        *network,
+		Credentials:    *credentials,
+		BackfillEpochs: *backfillEpochs,
+		StateTimeout:   *stateTimeout,
 	}
 	logConfig(conf)
 	return conf, nil
@@ -74,14 +79,15 @@ func NewCliConfig() (*Config, error) {
 
 func logConfig(cfg *Config) {
 	log.WithFields(log.Fields{
-		"PoolNames":    cfg.PoolNames,
-		"DatabasePath": cfg.DatabasePath,
-		"Eth1Address":  cfg.Eth1Address,
-		"Eth2Address":  cfg.Eth2Address,
-		"EpochDebug":   cfg.EpochDebug,
-		"Verbosity":    cfg.Verbosity,
-		"Network":      cfg.Network,
-		"Credentials":  "***",
-		"StateTimeout": cfg.StateTimeout,
+		"PoolNames":      cfg.PoolNames,
+		"DatabasePath":   cfg.DatabasePath,
+		"Eth1Address":    cfg.Eth1Address,
+		"Eth2Address":    cfg.Eth2Address,
+		"EpochDebug":     cfg.EpochDebug,
+		"Verbosity":      cfg.Verbosity,
+		"Network":        cfg.Network,
+		"Credentials":    "***",
+		"BackfillEpochs": cfg.BackfillEpochs,
+		"StateTimeout":   cfg.StateTimeout,
 	}).Info("Cli Config:")
 }

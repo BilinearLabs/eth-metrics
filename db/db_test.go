@@ -5,7 +5,6 @@ import (
 	"testing"
 
 	"github.com/bilinearlabs/eth-metrics/schemas"
-	log "github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
 )
 
@@ -22,7 +21,6 @@ func Test_GetMissingEpochs(t *testing.T) {
 	})
 
 	epochs, err := db.GetMissingEpochs(200, 4)
-	log.Info("Epochs: ", epochs)
 	require.NoError(t, err)
 	require.Equal(t, []uint64{197, 198, 199, 200}, epochs)
 
@@ -33,7 +31,10 @@ func Test_GetMissingEpochs(t *testing.T) {
 	})
 
 	epochs, err = db.GetMissingEpochs(200, 4)
-	log.Info("Epochs: ", epochs)
 	require.NoError(t, err)
 	require.Equal(t, []uint64{198, 199, 200}, epochs)
+
+	epochs, err = db.GetMissingEpochs(200, 0)
+	require.NoError(t, err)
+	require.Equal(t, []uint64{}, epochs)
 }

@@ -52,12 +52,10 @@ func (p *BeaconState) Run(
 	valKeyToIndex map[string]uint64) error {
 
 	if currentBeaconState == nil || prevBeaconState == nil {
-		// TODO: Error?
-		return errors.New("TODO:")
+		return errors.New("current or previous beacon state is nil")
 	}
 	if len(validatorKeys) == 0 {
-		// TODO: Error?
-		return errors.New("TODO:")
+		return errors.New("no validator keys provided")
 	}
 
 	currentSlot, err := currentBeaconState.Slot()
@@ -85,7 +83,7 @@ func (p *BeaconState) Run(
 		prevBeaconState)
 
 	if err != nil {
-		return errors.Wrap(err, "TODO")
+		return errors.Wrap(err, "error populating participation and balance")
 	}
 
 	syncCommitteeKeys := BLSPubKeyToByte(GetCurrentSyncCommittee(currentBeaconState))
@@ -267,7 +265,6 @@ func GetTotalBalanceAndEffective(
 			continue
 		}
 		valBalance := big.NewInt(0).SetUint64(balances[valIdx])
-		//log.Info(valIdx, ":", valBalance)
 		valEffBalance := big.NewInt(0).SetUint64(uint64(validators[valIdx].EffectiveBalance))
 		totalBalances.Add(totalBalances, valBalance)
 		effectiveBalance.Add(effectiveBalance, valEffBalance)
@@ -461,17 +458,6 @@ func (p *BeaconState) GetParticipation(
 	}
 	return nIncorrectSource, nIncorrectTarget, nIncorrectHead, indexesMissedAtt
 }
-
-/* TODO: Unused. Add support for Bellatrix
-func GetInactivityScores(
-	activeValidatorIndexes []uint64,
-	beaconState *spec.VersionedBeaconState) []uint64 {
-	inactivityScores := make([]uint64, 0)
-	for _, valIdx := range activeValidatorIndexes {
-		inactivityScores = append(inactivityScores, beaconState.Altair.InactivityScores[valIdx])
-	}
-	return inactivityScores
-}*/
 
 // Check if bit n (0..7) is set where 0 is the LSB in little endian
 func isBitSet(input uint8, n int) bool {
