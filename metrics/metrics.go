@@ -131,6 +131,7 @@ func (a *Metrics) Run() {
 		a.networkParameters,
 		a.db,
 		a.config,
+		a.networkParameters.slotsInEpoch,
 	)
 	if err != nil {
 		log.Fatal(err)
@@ -301,7 +302,10 @@ func (a *Metrics) ProcessEpoch(
 		validatorIndexes := GetIndexesFromKeys(pubKeys, valKeyToIndex)
 
 		// TODO Rename this
-		a.beaconState.Run(pubKeys, poolName, currentBeaconState, prevBeaconState, valKeyToIndex)
+		err = a.beaconState.Run(pubKeys, poolName, currentBeaconState, prevBeaconState, valKeyToIndex)
+		if err != nil {
+			return nil, errors.Wrap(err, "error running beacon state")
+		}
 
 		err = a.proposalDuties.RunProposalMetrics(validatorIndexes, poolName, &proposalMetrics)
 		if err != nil {

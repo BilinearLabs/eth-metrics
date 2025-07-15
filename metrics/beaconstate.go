@@ -27,6 +27,7 @@ type BeaconState struct {
 	networkParameters *NetworkParameters
 	database          *db.Database
 	config            *config.Config
+	slotsInEpoch      uint64
 }
 
 func NewBeaconState(
@@ -34,6 +35,7 @@ func NewBeaconState(
 	networkParameters *NetworkParameters,
 	database *db.Database,
 	config *config.Config,
+	slotsInEpoch uint64,
 ) (*BeaconState, error) {
 
 	return &BeaconState{
@@ -41,6 +43,7 @@ func NewBeaconState(
 		networkParameters: networkParameters,
 		database:          database,
 		config:            config,
+		slotsInEpoch:      slotsInEpoch,
 	}, nil
 }
 
@@ -68,8 +71,10 @@ func (p *BeaconState) Run(
 		return errors.Wrap(err, "error getting slot from previous beacon state")
 	}
 
-	if currentSlot != (prevSlot + phase0.Slot(1)) {
-		return errors.New("slot mismatch between current and previous beacon state")
+	// Distance shall be the slots in an epoch
+	if currentSlot != (prevSlot + phase0.Slot(p.slotsInEpoch)) {
+		return errors.New(fmt.Sprintf("slot mismatch between current and previous beacon state: %d vs %d",
+			currentSlot, prevSlot))
 	}
 
 	validatorIndexes := GetIndexesFromKeys(validatorKeys, valKeyToIndex)
